@@ -22,6 +22,11 @@ type DeviceConfig struct {
 	Slug string
 	// Override the default boot partition start LBA (default: 8192 sectors = 4MiB)
 	BootPartitionStartLBA int64
+	// Override the boot (FAT) partition size in MB (default: 100 MB)
+	BootPartitionSizeMB int64
+	// Override the MBR partition type byte for the boot partition
+	// (default: 0x0c = FAT32 LBA). Use 0x06 for FAT16B.
+	MBRPartitionType byte
 }
 
 const (
@@ -83,6 +88,16 @@ var (
 			BootPartitionStartLBA: 2048, // 1MiB from start of disk
 			Slug:                  "bpi_r1",
 		},
+		// Milk-V Duo (CV1800B / Sophgo SG2002, RISC-V)
+		// https://milkv.io/docs/duo/getting-started/boot
+		// BootROM reads MBR partition table, finds active FAT partition,
+		// then reads fip.bin as a regular file from the FAT filesystem.
+	"Milk-V Duo": {
+		MBROnlyWithoutGPT:     true,
+		BootPartitionStartLBA: 1,   // BootROM expects FAT at LBA 1
+		BootPartitionSizeMB:   128, // match vendor Buildroot layout (128MB FAT16)
+		Slug:                  "milkv_duo",
+	},
 	}
 )
 

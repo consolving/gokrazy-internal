@@ -35,6 +35,21 @@ const (
 	clean = uint16(0xFFFF)
 )
 
+// Config allows overriding default BPB values for device-specific compatibility.
+// Zero values leave the default in place for most fields; use the Set fields
+// for fields where zero is a valid value (HiddenSectors, DriveNumber).
+type Config struct {
+	NumFATs          int  // 0 = default (1)
+	MinRootEntries   int  // 0 = computed from entries
+	Heads            int  // 0 = default (4)
+	HiddenSectors    int  // only used if HiddenSectorsSet
+	DriveNumber      int  // only used if DriveNumberSet
+	SpareSectors     int  // extra sectors of free space at end of image
+
+	HiddenSectorsSet bool
+	DriveNumberSet   bool
+}
+
 type paddingWriter struct {
 	w     io.Writer
 	count int
@@ -153,7 +168,7 @@ type Writer struct {
 	// dataTmp is a temporary file to which all file data will be
 	// written. Calling Flush will write the appropriate headers (for
 	// which the file data must be known) to the writer, then append
-	// dataTmp’s contents.
+	// dataTmp's contents.
 	dataTmp *os.File
 
 	// fat is a File Allocation Table holding one entry for each
@@ -166,6 +181,8 @@ type Writer struct {
 
 	pending *fatUpdatingWriter
 
+	config Config
+
 	TotalSectors int // populated after Flush
 }
 
@@ -176,10 +193,15 @@ type Writer struct {
 // depends on the size of the file allocation table and number of root
 // directory entries, a temporary file is used to store data until
 // Flush is called.
-func NewWriter(w io.Writer) (*Writer, error) {
+func NewWriter(w io.Writer, config ...Config) (*Writer, error) {
 	f, err := ioutil.TempFile("", "writefat")
 	if err != nil {
 		return nil, err
+	}
+
+	cfg := Config{}
+	if len(config) > 0 {
+		cfg = config[0]
 	}
 
 	return &Writer{
@@ -192,6 +214,7 @@ func NewWriter(w io.Writer) (*Writer, error) {
 			(uint16(0xFF) << 8) | uint16(hardDisk), // media descriptor
 			clean,                                  // file system state
 		},
+		config: cfg,
 	}, nil
 }
 
@@ -327,17 +350,26 @@ func (fw *Writer) File(path string, modTime time.Time) (io.Writer, error) {
 }
 
 func (fw *Writer) writeFAT() error {
-	w := &paddingWriter{
-		w:     fw.w,
-		padTo: int(sectorSize)}
+	numFATs := 1
+	if fw.config.NumFATs > 0 {
+		numFATs = fw.config.NumFATs
+	}
+	for copy := 0; copy < numFATs; copy++ {
+		w := &paddingWriter{
+			w:     fw.w,
+			padTo: int(sectorSize)}
 
-	for _, entry := range fw.fat {
-		if err := binary.Write(w, binary.LittleEndian, entry); err != nil {
+		for _, entry := range fw.fat {
+			if err := binary.Write(w, binary.LittleEndian, entry); err != nil {
+				return err
+			}
+		}
+
+		if err := w.Flush(); err != nil {
 			return err
 		}
 	}
-
-	return w.Flush()
+	return nil
 }
 
 func dirEntryCount(d *directory) int {
@@ -353,17 +385,44 @@ func (fw *Writer) usableFATEntries() int {
 	return len(fw.fat) - int(unusableClusters)
 }
 
-func (fw *Writer) writeBootSector(w io.Writer, fatSectors, reservedSectors int) (int, error) {
-	dataSectors := fw.usableFATEntries() * int(sectorsPerCluster)
-	rootDirEntries := dirEntryCount(fw.root)
-	// The root directory must span an integral number of sectors:
+func (fw *Writer) rootDirEntries() (rootDirSectors int, rootDirEntries int) {
+	rootDirEntries = dirEntryCount(fw.root)
 	const (
 		dirEntrySize     = 32 // bytes
 		entriesPerSector = (int(sectorSize) / dirEntrySize)
 	)
-	rootDirSectors := ((rootDirEntries + entriesPerSector - 1) / entriesPerSector)
+	rootDirSectors = ((rootDirEntries + entriesPerSector - 1) / entriesPerSector)
 	rootDirEntries = rootDirSectors * entriesPerSector
-	totalSectors := reservedSectors + rootDirSectors + fatSectors + dataSectors
+	if fw.config.MinRootEntries > 0 && rootDirEntries < fw.config.MinRootEntries {
+		rootDirSectors = (fw.config.MinRootEntries + entriesPerSector - 1) / entriesPerSector
+		rootDirEntries = rootDirSectors * entriesPerSector
+	}
+	return rootDirSectors, rootDirEntries
+}
+
+func (fw *Writer) writeBootSector(w io.Writer, fatSectors, reservedSectors int) (int, error) {
+	dataSectors := fw.usableFATEntries() * int(sectorsPerCluster)
+
+	numFATs := 1
+	if fw.config.NumFATs > 0 {
+		numFATs = fw.config.NumFATs
+	}
+
+	rootDirSectors, rootDirEntries := fw.rootDirEntries()
+	totalSectors := reservedSectors + rootDirSectors + numFATs*fatSectors + dataSectors
+	heads := 4
+	if fw.config.Heads > 0 {
+		heads = fw.config.Heads
+	}
+	hiddenSectors := uint32(1)
+	if fw.config.HiddenSectorsSet {
+		hiddenSectors = uint32(fw.config.HiddenSectors)
+	}
+	driveNumber := uint8(0x80)
+	if fw.config.DriveNumberSet {
+		driveNumber = uint8(fw.config.DriveNumber)
+	}
+
 	var (
 		jumpCode            = [3]byte{0xEB, 0x3C, 0x90}
 		OEM                 = [8]byte{'g', 'o', 'k', 'r', 'a', 'z', 'y', '!'}
@@ -378,16 +437,16 @@ func (fw *Writer) writeBootSector(w io.Writer, fatSectors, reservedSectors int) 
 		sectorSize,              // in bytes
 		sectorsPerCluster,       // i.e. each FAT entry covers sectorsPerCluster*sectorSize bytes
 		uint16(reservedSectors), // reserved sectors
-		uint8(1),                // one copy of the FAT
+		uint8(numFATs),          // number of FAT copies
 		uint16(rootDirEntries),  // root directory entries
 		uint16(0),               // 0 = use uint32 number of sectors following later
 		hardDisk,                // media descriptor
 		uint16(fatSectors),      // number of sectors per FAT
 		uint16(32),              // (only for bootcode) number of sectors per track
-		uint16(4),               // (only for bootcode) number of heads
-		uint32(1),               // no hidden sectors
+		uint16(heads),           // (only for bootcode) number of heads
+		hiddenSectors,           // hidden sectors (offset to partition start)
 		uint32(totalSectors),    // total number of sectors
-		uint8(0x80),             // (only for bootcode) drive number
+		driveNumber,             // (only for bootcode) drive number
 		uint8(0),                // (only for bootcode) current head
 		uint8(0x29),             // magic value: boot signature
 		uint32(0xf3f37b84),      // TODO: volume ID
@@ -666,6 +725,18 @@ func (fw *Writer) Flush() error {
 		fw.fat = append(fw.fat, pad...)
 	}
 
+	// Add spare clusters for free space (e.g., for boot logs).
+	// These clusters have FAT entry value 0 (free) and their data area
+	// sectors will be zero-padded on output.
+	if fw.config.SpareSectors > 0 {
+		spareClusters := (fw.config.SpareSectors + int(sectorSize)*int(sectorsPerCluster) - 1) /
+			(int(sectorSize) * int(sectorsPerCluster))
+		if spareClusters > 0 {
+			pad := make([]uint16, spareClusters)
+			fw.fat = append(fw.fat, pad...)
+		}
+	}
+
 	// TODO: why fullSectors, the FAT is in clusters?!
 	fatSectors := fullSectors(len(fw.fat) * 2)
 
@@ -687,7 +758,8 @@ func (fw *Writer) Flush() error {
 		return err
 	}
 
-	// root directory
+	// root directory — must fill exactly rootDirSectors sectors
+	rootDirSectors, _ := fw.rootDirEntries()
 	pw = &paddingWriter{
 		w:     fw.w,
 		padTo: int(sectorSize),
@@ -698,13 +770,32 @@ func (fw *Writer) Flush() error {
 	if err := pw.Flush(); err != nil {
 		return err
 	}
+	remainingRootBytes := rootDirSectors*int(sectorSize) - pw.count
+	if remainingRootBytes > 0 {
+		if _, err := fw.w.Write(make([]byte, remainingRootBytes)); err != nil {
+			return err
+		}
+	}
 
 	// data area
+	dataTmpSize, err := fw.dataTmp.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
 	if _, err := fw.dataTmp.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	if _, err := io.Copy(fw.w, fw.dataTmp); err != nil {
 		return err
+	}
+
+	// Pad with zeros to fill spare clusters (free space)
+	expectedDataSize := int64(fw.usableFATEntries() * clusterSize)
+	if dataTmpSize < expectedDataSize {
+		zeroPad := make([]byte, expectedDataSize-dataTmpSize)
+		if _, err := fw.w.Write(zeroPad); err != nil {
+			return err
+		}
 	}
 
 	fw.dataTmp.Close()
